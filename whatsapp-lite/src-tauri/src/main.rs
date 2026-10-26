@@ -22,6 +22,31 @@ const MENU_AUTOSTART_TOGGLE_ID: &str = "menu_autostart_toggle";
 const MENU_DEEP_LINK_TOGGLE_ID: &str = "menu_deep_link_toggle";
 const MENU_DOWNLOAD_FOLDER_PICK_ID: &str = "menu_download_folder_pick";
 const MENU_DOWNLOAD_FOLDER_RESET_ID: &str = "menu_download_folder_reset";
+const MENU_CLOSE_TO_TRAY_ID: &str = "menu_close_to_tray";
+const MENU_SHORTCUT_TOGGLE_ID: &str = "menu_shortcut_toggle";
+
+/// X de la ventana: false = salir de verdad (default), true = ocultar a la bandeja.
+const FLAG_CLOSE_TO_TRAY: &str = "close_to_tray";
+/// Ctrl+Alt+W global: false por defecto; era la via mas silenciosa de "se abre solo".
+const FLAG_GLOBAL_SHORTCUT: &str = "global_shortcut";
+
+/// Argumentos de Chromium para el WebView. Con MPO (Multi-Plane Overlay) activo,
+/// WebView2 repinta la ventana entera al mostrarse u ocultarse y la pantalla parpadea.
+///
+/// wry usa estos argumentos *en lugar de* sus defaults
+/// (`--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`), no ademas
+/// (wry-0.54.4/src/webview2/mod.rs:294-297). Pasarlos solo con la feature nueva
+/// reactivaba la UI OOUI, el visor PDF de Edge y SmartScreen dentro del WebView:
+/// por eso la lista completa va explicita.
+const WEBVIEW_ARGS: &str =
+    "--disable-features=CalculateNativeWinOcclusion,msWebOOUI,msPdfOOUI,msSmartScreenProtection";
+
+/// Script inyectado antes que el codigo de WhatsApp Web: limita y agrupa las
+/// notificaciones del sistema (ver notification_guard.js).
+const NOTIFICATION_GUARD_JS: &str = include_str!("notification_guard.js");
+
+/// Ajuste de layout y permiso de notificaciones del WebView.
+const BOOTSTRAP_JS: &str = r#"(function(){try{const s=document.createElement('style');s.innerHTML='#app,.app-wrapper{height:100%!important;width:100%!important;position:absolute;top:0;left:0;}';document.head.appendChild(s);}catch(e){}try{if('Notification'in window&&Notification.permission!=='granted'){Notification.requestPermission().catch(function(){});}}catch(e){}})();"#;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct DownloadSettings {
@@ -203,6 +228,48 @@ fn write_deep_link_enabled<R: Runtime>(
     Ok(())
 }
 
+fn read_flag<R: Runtime>(app_handle: &AppHandle<R>, name: &str, default: bool) -> bool {
+    let config_dir = app_handle.path().app_data_dir().unwrap_or_default();
+    let config_file = config_dir.join(format!("{name}.enabled"));
+    if !config_file.exists() {
+        return default;
+    }
+    fs::read_to_string(&config_file)
+        .map(|content| content.trim() == "true")
+        .unwrap_or(default)
+}
+
+fn write_flag<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    name: &str,
+    value: bool,
+) -> std::io::Result<()> {
+    let config_dir = app_handle.path().app_data_dir().unwrap_or_default();
+    fs::create_dir_all(&config_dir)?;
+    fs::write(
+        config_dir.join(format!("{name}.enabled")),
+        if value { "true" } else { "false" },
+    )
+}
+
+/// Registro de quien abre/cierra la ventana: sin esto el "se abre solo" es invisible.
+pub fn log_event<R: Runtime>(app_handle: &AppHandle<R>, message: &str) {
+    use std::io::Write;
+    let config_dir = app_handle.path().app_data_dir().unwrap_or_default();
+    let _ = fs::create_dir_all(&config_dir);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(config_dir.join("events.log"))
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{ts} {message}");
+    }
+}
+
 fn parse_whatsapp_link(link: &str) -> Option<tauri::Url> {
     let link = tauri::Url::parse(link).ok()?;
     if link.scheme() != "whatsapp"
@@ -288,6 +355,8 @@ fn handle_link<R: Runtime>(app: &AppHandle<R>, url: &str) {
 fn build_native_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<tauri::menu::Menu<R>> {
     let autostart = app.autolaunch().is_enabled().unwrap_or(false);
     let deep_link = read_deep_link_enabled(app);
+    let close_to_tray = read_flag(app, FLAG_CLOSE_TO_TRAY, false);
+    let shortcut_on = read_flag(app, FLAG_GLOBAL_SHORTCUT, false);
     let dl_settings = read_download_settings(app);
 
     let folder_label = match &dl_settings.download_path {
@@ -304,6 +373,19 @@ fn build_native_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<tauri::men
         .item(
             &CheckMenuItemBuilder::with_id(MENU_DEEP_LINK_TOGGLE_ID, "Handle WhatsApp Links")
                 .checked(deep_link)
+                .build(app)?,
+        )
+        .item(
+            &CheckMenuItemBuilder::with_id(
+                MENU_CLOSE_TO_TRAY_ID,
+                "Close to Tray (X hides, app keeps running)",
+            )
+            .checked(close_to_tray)
+            .build(app)?,
+        )
+        .item(
+            &CheckMenuItemBuilder::with_id(MENU_SHORTCUT_TOGGLE_ID, "Ctrl+Alt+W toggles window")
+                .checked(shortcut_on)
                 .build(app)?,
         )
         .separator()
@@ -347,13 +429,14 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(autostart_init(MacosLauncher::default(), None))
         .plugin(tauri_plugin_single_instance::init(|app, argv, _| {
+            log_event(app, &format!("single-instance: argv={argv:?}"));
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();
-                for arg in argv {
-                    if arg.starts_with("whatsapp://") || arg.contains("chat.whatsapp.com") {
-                        handle_link(app, &arg);
-                    }
+            }
+            for arg in argv {
+                if arg.starts_with("whatsapp://") || arg.contains("chat.whatsapp.com") {
+                    handle_link(app, &arg);
                 }
             }
         }))
@@ -367,9 +450,11 @@ fn main() {
                         if let Some(w) = app.get_webview_window("main") {
                             if w.is_visible().unwrap_or(false) {
                                 let _ = w.hide();
+                                log_event(app, "shortcut: hide");
                             } else {
                                 let _ = w.show();
                                 let _ = w.set_focus();
+                                log_event(app, "shortcut: show");
                             }
                         }
                     }
@@ -391,7 +476,9 @@ fn main() {
 
             let w = WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
                 .disable_drag_drop_handler()
-                .initialization_script(r#"(function(){try{const s=document.createElement('style');s.innerHTML='#app,.app-wrapper{height:100%!important;width:100%!important;position:absolute;top:0;left:0;}';document.head.appendChild(s);}catch(e){}try{if('Notification'in window&&Notification.permission!=='granted'){Notification.requestPermission().catch(function(){});}}catch(e){}})();"#)
+                .additional_browser_args(WEBVIEW_ARGS)
+                .initialization_script(NOTIFICATION_GUARD_JS)
+                .initialization_script(BOOTSTRAP_JS)
                 // 1. Intercept normal frame-level navigation
                 .on_navigation(move |url: &tauri::Url| {
                     let url_str = url.as_str();
@@ -515,7 +602,10 @@ fn main() {
                     for url in urls {
                         let u = url.as_str().to_string();
                         let h = handle.clone();
-                        tauri::async_runtime::spawn(async move {
+                        // spawn_blocking, no spawn: thread::sleep dentro de una tarea
+                        // async bloquea un worker del reactor tokio durante 1,5 s
+                        // (B-01 de BUGS_FOUND.md).
+                        tauri::async_runtime::spawn_blocking(move || {
                             std::thread::sleep(std::time::Duration::from_millis(1500));
                             handle_link(&h, &u);
                         });
@@ -527,11 +617,13 @@ fn main() {
             let _ = app.set_menu(menu.clone());
             let _ = w.set_menu(menu);
 
-            if let Err(error) = handle
-                .global_shortcut()
-                .register(Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyW))
-            {
-                eprintln!("failed to register Ctrl+Alt+W global shortcut: {error}");
+            if read_flag(&handle, FLAG_GLOBAL_SHORTCUT, false) {
+                if let Err(error) = handle
+                    .global_shortcut()
+                    .register(Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyW))
+                {
+                    eprintln!("failed to register Ctrl+Alt+W global shortcut: {error}");
+                }
             }
             let _ = tray::setup_tray(&handle);
 
@@ -539,6 +631,9 @@ fn main() {
         })
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();
+            // El picker de carpeta reconstruye el menu desde su callback (que corre
+            // despues de este handler); el bloque comun no debe hacerlo otra vez.
+            let mut rebuild_menu = true;
             if id == MENU_AUTOSTART_TOGGLE_ID {
                 let state = !app.autolaunch().is_enabled().unwrap_or(false);
                 let _ = if state { app.autolaunch().enable() } else { app.autolaunch().disable() };
@@ -553,7 +648,28 @@ fn main() {
                         let _ = app.deep_link().unregister("whatsapp");
                     }
                 }
+            } else if id == MENU_CLOSE_TO_TRAY_ID {
+                let state = !read_flag(app, FLAG_CLOSE_TO_TRAY, false);
+                let _ = write_flag(app, FLAG_CLOSE_TO_TRAY, state);
+                log_event(
+                    app,
+                    if state { "menu: close_to_tray=on" } else { "menu: close_to_tray=off" },
+                );
+            } else if id == MENU_SHORTCUT_TOGGLE_ID {
+                let state = !read_flag(app, FLAG_GLOBAL_SHORTCUT, false);
+                let _ = write_flag(app, FLAG_GLOBAL_SHORTCUT, state);
+                let sc = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyW);
+                if state {
+                    let _ = app.global_shortcut().register(sc);
+                } else {
+                    let _ = app.global_shortcut().unregister(sc);
+                }
+                log_event(
+                    app,
+                    if state { "menu: global_shortcut=on" } else { "menu: global_shortcut=off" },
+                );
             } else if id == MENU_DOWNLOAD_FOLDER_PICK_ID {
+                rebuild_menu = false;
                 let app_handle = app.clone();
                 app.dialog().file().pick_folder(move |folder_path| {
                     if let Some(path) = folder_path {
@@ -566,6 +682,7 @@ fn main() {
                                     let _ = w.set_menu(m);
                                 }
                             }
+                            log_event(&app_handle, "menu: download_folder_set");
                         }
                     }
                 });
@@ -575,16 +692,25 @@ fn main() {
                 let _ = write_download_settings(app, &settings);
             }
 
-            if let Some(w) = app.get_webview_window("main") {
-                if let Ok(m) = build_native_menu(app) {
-                    let _ = w.set_menu(m);
+            if rebuild_menu {
+                if let Some(w) = app.get_webview_window("main") {
+                    if let Ok(m) = build_native_menu(app) {
+                        let _ = w.set_menu(m);
+                    }
                 }
             }
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+                let app = window.app_handle();
+                if read_flag(app, FLAG_CLOSE_TO_TRAY, false) {
+                    let _ = window.hide();
+                    api.prevent_close();
+                    log_event(app, "close: hidden to tray");
+                } else {
+                    log_event(app, "close: exit");
+                    app.exit(0);
+                }
             }
         })
         .run(tauri::generate_context!())
@@ -748,5 +874,109 @@ mod url_validation_tests {
         assert!(reserved.contains(&active));
         drop(reserved);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    /// La capability de la ventana se aplica a un origen REMOTO
+    /// (https://web.whatsapp.com). Cada permiso de plugin que aparezca ahi es
+    /// superficie IPC que la pagina puede invocar. Los plugins se usan desde Rust,
+    /// cuya API no consulta la ACL, asi que no hacen falta.
+    const CAPABILITY: &str = include_str!("../capabilities/default.json");
+
+    #[test]
+    fn remote_capability_grants_no_plugin_permissions() {
+        for forbidden in [
+            "opener:",
+            "dialog:",
+            "notification:",
+            "autostart:",
+            "global-shortcut:",
+        ] {
+            assert!(
+                !CAPABILITY.contains(forbidden),
+                "la capability remota no debe conceder {forbidden}"
+            );
+        }
+        assert!(CAPABILITY.contains("core:default"));
+        assert!(CAPABILITY.contains("https://web.whatsapp.com/**"));
+    }
+}
+
+#[cfg(test)]
+mod notification_guard_tests {
+    use super::{BOOTSTRAP_JS, NOTIFICATION_GUARD_JS, WEBVIEW_ARGS};
+
+    /// Lee el valor de una declaracion `var NOMBRE = <entero>;` del script inyectado.
+    fn numeric_constant(source: &str, declaration: &str) -> u64 {
+        let start = source.find(declaration).expect("declaracion ausente");
+        let rest = &source[start + declaration.len()..];
+        let digits: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().expect("valor no numerico")
+    }
+
+    #[test]
+    fn guard_wraps_the_native_notification_api() {
+        assert!(NOTIFICATION_GUARD_JS.contains("window.Notification = Guarded"));
+        assert!(NOTIFICATION_GUARD_JS.contains("__waTauriNotifyGuard"));
+        // Un fallo del guard debe devolver el control a la API nativa de WhatsApp.
+        assert!(NOTIFICATION_GUARD_JS.contains("catch (e)"));
+    }
+
+    #[test]
+    fn notification_limits_stay_within_the_designed_range() {
+        let chat_window = numeric_constant(NOTIFICATION_GUARD_JS, "var CHAT_WINDOW_MS =");
+        let global_max = numeric_constant(NOTIFICATION_GUARD_JS, "var GLOBAL_MAX =");
+        // Cero volveria a inundar la pantalla; un valor alto silencia WhatsApp.
+        assert!((1000..=60_000).contains(&chat_window), "{chat_window}");
+        assert!((1..=20).contains(&global_max), "{global_max}");
+    }
+
+    #[test]
+    fn bootstrap_keeps_layout_fix_and_notification_permission() {
+        assert!(BOOTSTRAP_JS.contains("app-wrapper"));
+        assert!(BOOTSTRAP_JS.contains("requestPermission"));
+    }
+
+    #[test]
+    fn webview_args_disable_occlusion_repaint() {
+        assert!(WEBVIEW_ARGS.contains("--disable-features=CalculateNativeWinOcclusion"));
+    }
+
+    #[test]
+    fn webview_args_keep_the_wry_defaults() {
+        // additional_browser_args SUSTITUYE los defaults de wry
+        // (wry-0.54.4/src/webview2/mod.rs:294). Si esta lista pierde una feature,
+        // el WebView recupera la barra OOUI, el visor PDF de Edge y SmartScreen.
+        for feature in [
+            "CalculateNativeWinOcclusion",
+            "msWebOOUI",
+            "msPdfOOUI",
+            "msSmartScreenProtection",
+        ] {
+            assert!(
+                WEBVIEW_ARGS.contains(feature),
+                "falta {feature} en WEBVIEW_ARGS: {WEBVIEW_ARGS}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_covers_the_service_worker_notification_path() {
+        // WhatsApp puede avisar por ServiceWorkerRegistration.showNotification;
+        // si esa via queda abierta la rafaga vuelve igual que por window.Notification.
+        assert!(NOTIFICATION_GUARD_JS.contains("ServiceWorkerRegistration"));
+        assert!(NOTIFICATION_GUARD_JS.contains("showNotification"));
+    }
+
+    #[test]
+    fn guard_groups_suppressed_messages_instead_of_dropping_them() {
+        assert!(NOTIFICATION_GUARD_JS.contains("mensajes nuevos"));
+        assert!(NOTIFICATION_GUARD_JS.contains("__waTauriNotifyGuardState"));
     }
 }

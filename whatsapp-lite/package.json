@@ -1,15 +1,16 @@
 {
   "name": "whatsapp-tauri",
   "private": true,
-  "version": "0.3.3",
+  "version": "0.3.4",
   "author": "Wpnnt",
   "type": "module",
   "scripts": {
-    "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build",
+    "tauri": "node scripts/tauri.mjs",
+    "dev": "node scripts/tauri.mjs dev",
+    "build": "node scripts/tauri.mjs build",
+    "test:js": "node --test tests/notification-guard.test.mjs",
     "version": "node scripts/update-version.cjs",
-    "icons": "tauri icon src-tauri/app-icon.png --output src-tauri/icons"
+    "icons": "node scripts/tauri.mjs icon src-tauri/app-icon.png --output src-tauri/icons"
   },
   "dependencies": {},
   "devDependencies": {

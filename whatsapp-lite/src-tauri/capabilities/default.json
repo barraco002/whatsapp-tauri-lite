@@ -1,25 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Core-only capability for the remote WhatsApp Web view. Plugins (opener, dialog, notification, autostart, global-shortcut) are driven from Rust, which does not go through the ACL, so the remote origin gets no plugin IPC surface.",
   "windows": ["main"],
   "remote": {
     "urls": ["https://web.whatsapp.com/**"]
   },
-  "permissions": [
-    "core:default",
-    "opener:default",
-    "notification:default",
-    "autostart:default",
-    "global-shortcut:default",
-    "core:tray:default",
-    "dialog:default",
-    {
-      "identifier": "opener:allow-open-url",
-      "allow": [
-        { "url": "http://**" },
-        { "url": "https://**" }
-      ]
-    }
-  ]
+  "permissions": ["core:default"]
 }

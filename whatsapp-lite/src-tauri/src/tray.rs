@@ -2,7 +2,7 @@ use tauri::menu::MenuBuilder;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Runtime};
 
-use crate::window;
+use crate::{log_event, window};
 
 pub fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let menu = MenuBuilder::new(app)
@@ -22,8 +22,14 @@ pub fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
     builder
         .on_menu_event(move |app, event| match event.id().as_ref() {
-            "open" => window::show(app),
-            "quit" => app.exit(0),
+            "open" => {
+                log_event(app, "tray: open");
+                window::show(app);
+            }
+            "quit" => {
+                log_event(app, "tray: quit");
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -31,6 +37,7 @@ pub fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 event
             {
                 if button == tauri::tray::MouseButton::Left {
+                    log_event(tray.app_handle(), "tray: click");
                     window::show(tray.app_handle());
                 }
             }

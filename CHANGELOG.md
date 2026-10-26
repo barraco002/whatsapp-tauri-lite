@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Development environment on this machine**: `npm run dev` and `npm run build` died before compiling with *"rustup could not choose a version of rustc"*, because the toolchain lives in `D:\dev\rustup` while `RUSTUP_HOME`/`CARGO_HOME` were unset. `scripts/msvc-env.mjs` resolves the portable toolchain and `scripts/tauri.mjs` launches the CLI with `RUSTUP_HOME`, `CARGO_HOME`, `RC`, `LIB`, `INCLUDE` and `PATH` already set. `npm run dev` no longer needs a hand-configured shell.
+- **Lost Chromium defaults in the WebView**: `additional_browser_args` replaces wry's defaults instead of adding to them (`wry-0.54.4/src/webview2/mod.rs:294`), so passing only `CalculateNativeWinOcclusion` re-enabled the OOUI bar, Edge's PDF viewer and SmartScreen inside the app. The full `--disable-features=` list is now explicit.
+- **Slow async worker on deep-link startup (B-01)**: the 1.5 s delay ran `std::thread::sleep` inside `async_runtime::spawn`, blocking a tokio worker; it now uses `spawn_blocking`.
+- **Double menu rebuild (B-02)**: selecting a custom download folder rebuilt the native menu twice (once in the dialog callback, once in the shared tail of the handler); the shared tail now runs once.
+- **Stale comment in `window::show`**: it still claimed the X always hides to the tray; the default is `app.exit(0)`.
+
+### Changed
+- **Remote capability reduced to `core:default`**: the window's capability applies to `https://web.whatsapp.com`, so `opener`, `dialog`, `notification`, `autostart` and `global-shortcut` IPC permissions were reachable from page JavaScript. Every plugin is driven from Rust, which does not go through the ACL. A contract test fails if a plugin permission returns to that file.
+- **CI gates reachable locally**: `scripts/build-msvc.ps1` gained `-Clippy` and `-Fmt`, the two checks the release workflow enforces.
+- `scripts/tauri.mjs dev` refuses to start when another `whatsapp-tauri.exe` is running (single-instance would silently steal the launch) and offers `--dev-isolated` with a separate identifier/profile.
+
+## [0.3.4] - 2026-10-24
+
+### Fixed
+- **Notification Flood and Screen Flicker**: WhatsApp Web inside the WebView emitted one Windows toast per incoming message. A burst (active chat, group, or the history resync after linking a device) queued dozens of toasts and forced a full WebView repaint for each one, so the desktop visibly flickered. A guard injected before the page code now allows **one toast per chat every 5 s**, caps the global budget at **6 toasts per minute**, and collapses the suppressed messages into a single "N mensajes nuevos" notice. If the guard throws, the native `Notification` API is left untouched, so WhatsApp keeps working.
+- **Whole-Window Repaint on Show/Hide**: the WebView now receives `--disable-features=CalculateNativeWinOcclusion`, which removes the full repaint (and the associated flicker) when the window is shown, hidden or restored from the tray.
+
+### Added
+- `src-tauri/src/notification_guard.js` and `tests/notification-guard.test.mjs`: seven behavior tests covering burst grouping, per-chat isolation, the global per-minute budget, static API delegation (`permission`, `requestPermission`), the fallback when no native `Notification` exists, and the `ServiceWorkerRegistration.showNotification` path — the second route a web page can use to raise a system toast. Run with `npm run test:js`.
+- Rust contract tests for the injected guard (limits inside the designed range, service-worker coverage, grouped-copy present), the bootstrap script and the WebView arguments.
+- `scripts/build-msvc.ps1`: reproduces the portable MSVC build (sets `RC`, `LIB`, `INCLUDE` and the linker from `D:\dev\BuildTools`) with `-Test`, `-Release` or `-Check`. Without it the Tauri build script aborts with "Are you sure you have RC.EXE in your $PATH" on machines with no Visual Studio installed.
+
+### Changed
+- The layout/notification bootstrap is now `BOOTSTRAP_JS` and the Chromium arguments are `WEBVIEW_ARGS`, both next to the guard, so the injection order is explicit: guard first, bootstrap second.
+
 ## [0.3.3] - 2026-10-24
 
 ### Added

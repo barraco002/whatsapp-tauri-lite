@@ -107,9 +107,30 @@ Requirements: Rust + Cargo, Node.js, and on Windows the MSVC build tools and Win
 git clone https://github.com/barraco002/whatsapp-tauri-lite.git
 cd whatsapp-tauri-lite/whatsapp-lite
 npm install
-npm run tauri dev      # development
-npm run tauri build    # release binary + installer
+npm run dev      # development window (tauri dev)
+npm run build    # release binary + installer
 ```
+
+On Windows without Visual Studio installed, the portable MSVC + Windows SDK in
+`D:\dev\BuildTools` is enough — but the Tauri build script needs `rc.exe` and the
+SDK headers on the environment, or it aborts with *"Are you sure you have RC.EXE in
+your $PATH"*. Both entry points resolve that environment for you:
+
+- `npm run dev` / `npm run build` go through `scripts/tauri.mjs`, which finds the
+  newest MSVC and SDK, sets `RUSTUP_HOME`, `CARGO_HOME`, `RC`, `LIB`, `INCLUDE`
+  and `PATH`, then launches `@tauri-apps/cli`.
+- `scripts/build-msvc.ps1` does the same for bare cargo and adds the CI gates:
+
+```powershell
+powershell -File scripts\build-msvc.ps1 -Test      # cargo test --all-targets
+powershell -File scripts\build-msvc.ps1 -Release   # cargo build --release
+powershell -File scripts\build-msvc.ps1 -Clippy    # cargo clippy -- -D warnings
+powershell -File scripts\build-msvc.ps1 -Fmt       # cargo fmt --check
+```
+
+Plain `cargo` and `npx tauri` need those variables in your own shell; without them
+rustup reports *"no default toolchain"* because the toolchain lives in
+`D:\dev\rustup`, not in `%USERPROFILE%\.rustup`. The scripts are the supported path.
 
 ## Project structure
 
@@ -117,6 +138,9 @@ npm run tauri build    # release binary + installer
 whatsapp-lite/            # the Tauri app
   src-tauri/src/main.rs   # window, menus, downloads, deep links, tray
   src-tauri/Cargo.toml    # deps + the tuned [profile.release]
+  scripts/msvc-env.mjs    # resolves the portable toolchain (single source)
+  scripts/tauri.mjs       # npm run dev|build -> @tauri-apps/cli with that env
+  scripts/build-msvc.ps1  # portable MSVC cargo (RC / LIB / INCLUDE) + CI gates
 perf/                     # measurement harness, raw evidence, verification
 BENCHMARKS.md             # what changed and what it cost
 OPTIMIZATION_REPORT.md    # full audit: phases, KPIs, rejected variants
